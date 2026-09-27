@@ -287,6 +287,7 @@ tfoot td,tfoot th{background:#f8fafb; font-weight:700; border-top:2px solid var(
   border:1px solid var(--line); background:#fff; padding:8px 13px; border-radius:999px;
   font-size:13px; font-weight:600; color:var(--muted); cursor:pointer; white-space:nowrap;
 }
+
 .tabs button.active{background:var(--primary); color:#fff; border-color:var(--primary);}
 .kv{display:flex; justify-content:space-between; gap:10px; padding:7px 0; border-bottom:1px dashed var(--line); font-size:13.5px;}
 .kv:last-child{border-bottom:0;}
@@ -336,6 +337,9 @@ tfoot td,tfoot th{background:#f8fafb; font-weight:700; border-top:2px solid var(
   min-height:32px;
   white-space:nowrap;
 }
+/* Backup icon in the app bar is visible only in developer mode */
+#backupBtn{display:none;}
+body.dev-mode #backupBtn{display:inline-flex;}
 
 @media (min-width:520px){
   .btn-row{grid-template-columns:repeat(auto-fit, minmax(130px, 1fr));}
@@ -366,3 +370,4 @@ tfoot td,tfoot th{background:#f8fafb; font-weight:700; border-top:2px solid var(
   .appbar .icon-btn[data-action="toggle-drawer"]{display:none;}
   .toasts{bottom:16px; left:auto; right:16px; width:340px;}
 }
+

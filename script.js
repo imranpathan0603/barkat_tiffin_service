@@ -2,8 +2,8 @@
    BARKAT TIFFIN SERVICE — script.js
    Offline-first tiffin management. IndexedDB + vanilla JS.
    Updated: safe delete, dynamic payment form, WhatsApp share,
-   monthly report share, mobile-friendly buttons, default first
-   food item rate.
+   monthly report share, sequential codes, developer tools,
+   theme customization, zero-subtotal filtering, dev-only backup icon.
    ============================================================ */
 'use strict';
 
@@ -25,12 +25,21 @@ const DEFAULT_SETTINGS = {
   defaultTiffinRate: 80,
   currency: '₹',
   registerEmpty: 'blank',
-  seeded: false
+  seeded: false,
+  developerMode: false,
+  sequences: { customer: 0, foodItem: 0, bill: 0, payment: 0 },
+  theme: {
+    primary: '#0f766e',
+    primaryDark: '#115e59',
+    primaryLight: '#ccfbf1',
+    bg: '#f1f5f6'
+  }
 };
 
 const ENTRY_STATUS  = ['DELIVERED','NOT_TAKEN','SKIPPED','CANCELLED'];
 const FOOD_TYPES    = ['MEAL','EXTRA','OTHER'];
 const PAYMENT_MODES = ['Cash','UPI','Bank Transfer','Cheque','Other'];
+const CODE_PREFIX   = { customer:'CUST', foodItem:'ITEM', bill:'BILL', payment:'PMT' };
 
 /* ==========================
    SMALL UTILITIES
@@ -115,12 +124,12 @@ function openDB(){
 function st(name, mode='readonly'){ return _db.transaction(name, mode).objectStore(name); }
 function pr(req){ return new Promise((res, rej) => { req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error); }); }
 
-/* ---------- DB HELPERS (both names available for safety) ---------- */
+/* DB helpers — dbDelete alias keeps legacy call sites working */
 const dbAll    = (n)       => pr(st(n).getAll());
 const dbGet    = (n, k)    => pr(st(n).get(k));
 const dbPut    = (n, o)    => pr(st(n, 'readwrite').put(o));
 const dbDel    = (n, k)    => pr(st(n, 'readwrite').delete(k));
-const dbDelete = dbDel;                        // alias — required by all delete paths
+const dbDelete = dbDel;
 const dbClear  = (n)       => pr(st(n, 'readwrite').clear());
 const dbIdx    = (n, i, q) => pr(st(n).index(i).getAll(q));
 
@@ -179,6 +188,9 @@ async function loadAll(){
   D.settings = Object.assign({}, DEFAULT_SETTINGS);
   settingsRows.forEach(r => { if (r.key === 'app' && r.value) Object.assign(D.settings, r.value); });
 
+  if (!D.settings.sequences) D.settings.sequences = Object.assign({}, DEFAULT_SETTINGS.sequences);
+  if (!D.settings.theme) D.settings.theme = Object.assign({}, DEFAULT_SETTINGS.theme);
+
   const entryMap = new Map();
   dailyEntries.forEach(e => entryMap.set(e.customerId + '|' + e.date, e));
   const itemsByEntry = new Map();
@@ -198,6 +210,52 @@ async function saveSettings(patch){
   const s = Object.assign({}, state.data.settings, patch);
   await dbPut('settings', { key: 'app', value: s });
   state.data.settings = s;
+}
+
+/* ==========================
+   SEQUENTIAL CODES
+   ========================== */
+async function nextCode(type){
+  const cur = Object.assign({ customer:0, foodItem:0, bill:0, payment:0 }, state.data.settings.sequences || {});
+  cur[type] = (Number(cur[type]) || 0) + 1;
+  await saveSettings({ sequences: cur });
+  return CODE_PREFIX[type] + '-' + String(cur[type]).padStart(4, '0');
+}
+
+async function syncSequences(){
+  const cur = Object.assign({ customer:0, foodItem:0, bill:0, payment:0 }, state.data.settings.sequences || {});
+  const maxNum = (arr, key) => arr.reduce((m,x) => {
+    const code = x[key] || '';
+    const match = String(code).match(/-(\d+)$/);
+    return match ? Math.max(m, Number(match[1])) : m;
+  }, 0);
+  let changed = false;
+  const maxC = maxNum(state.data.customers, 'customerCode');
+  if (maxC > cur.customer){ cur.customer = maxC; changed = true; }
+  const maxI = maxNum(state.data.foodItems, 'itemCode');
+  if (maxI > cur.foodItem){ cur.foodItem = maxI; changed = true; }
+  const maxB = maxNum(state.data.bills, 'billNo');
+  if (maxB > cur.bill){ cur.bill = maxB; changed = true; }
+  const maxP = maxNum(state.data.payments, 'paymentCode');
+  if (maxP > cur.payment){ cur.payment = maxP; changed = true; }
+  if (changed) await saveSettings({ sequences: cur });
+}
+
+/* ==========================
+   THEME + DEVELOPER-MODE BODY CLASS
+   ========================== */
+function applyTheme(){
+  const t = state.data.settings.theme || {};
+  const root = document.documentElement;
+  const set = (k, v) => { if (v) root.style.setProperty(k, v); };
+  set('--primary', t.primary);
+  set('--primary-dark', t.primaryDark);
+  set('--primary-light', t.primaryLight);
+  set('--bg', t.bg);
+  if (t.bg) document.body.style.background = t.bg;
+
+  /* Toggle body class so CSS can show/hide the dev-only backup icon */
+  document.body.classList.toggle('dev-mode', !!state.data.settings.developerMode);
 }
 
 /* ==========================
@@ -263,6 +321,7 @@ function paymentsInRange(from, to){
     .reduce((s, p) => s + (Number(p.amount) || 0), 0);
 }
 
+/* Monthly register — zero-subtotal customers are filtered out */
 function buildRegister(ym, companyId, search){
   const dim = daysInMonth(ym);
   let customers = state.data.customers.slice();
@@ -276,7 +335,7 @@ function buildRegister(ym, companyId, search){
     state.data.dailyEntries.some(e => e.customerId === c.id && e.date.startsWith(ym)));
   customers.sort((a,b) => (a.name||'').localeCompare(b.name||''));
 
-  const rows = customers.map(c => {
+  const allRows = customers.map(c => {
     const days = [];
     let subtotal = 0;
     for (let d = 1; d <= dim; d++){
@@ -288,6 +347,9 @@ function buildRegister(ym, companyId, search){
     }
     return { customer: c, days, subtotal };
   });
+
+  /* Hide customers whose monthly subtotal is zero */
+  const rows = allRows.filter(r => r.subtotal > 0);
 
   const dayTotals = [];
   for (let i = 0; i < dim; i++) dayTotals.push(rows.reduce((s,r) => s + r.days[i].amount, 0));
@@ -481,7 +543,7 @@ function customerCard(c){
       <div class="li-title">${esc(c.name)}
         <span class="badge ${c.status === 'ACTIVE' ? 'ok' : 'off'}">${c.status === 'ACTIVE' ? 'Active' : 'Inactive'}</span>
       </div>
-      <div class="li-sub">${esc(c.mobile || '—')}${c.companyId ? ' • ' + esc(companyName(c.companyId)) : ''}</div>
+      <div class="li-sub">${c.customerCode ? esc(c.customerCode) + ' · ' : ''}${esc(c.mobile || '—')}${c.companyId ? ' • ' + esc(companyName(c.companyId)) : ''}</div>
     </div>
     <div class="li-right">
       <div class="li-amount">${money(monthAmt)}</div>
@@ -553,7 +615,7 @@ VIEWS.customerDetail = function(){
       <div class="list-item">
         <div class="li-main">
           <div class="li-title">${money(p.amount)} <span class="badge info">${esc(p.paymentMode||'')}</span></div>
-          <div class="li-sub">${esc(dateLabel(p.paymentDate))}${p.reference ? ' • ' + esc(p.reference) : ''}${p.upiTransactionId ? ' • UPI: ' + esc(p.upiTransactionId) : ''}${p.chequeNumber ? ' • Chq: ' + esc(p.chequeNumber) : ''}</div>
+          <div class="li-sub">${p.paymentCode ? esc(p.paymentCode) + ' · ' : ''}${esc(dateLabel(p.paymentDate))}${p.reference ? ' • ' + esc(p.reference) : ''}${p.upiTransactionId ? ' • UPI: ' + esc(p.upiTransactionId) : ''}${p.chequeNumber ? ' • Chq: ' + esc(p.chequeNumber) : ''}</div>
         </div>
         <div class="li-right"><button class="btn sm danger ghost" data-action="delete-payment" data-id="${p.id}">Delete</button></div>
       </div>`).join('')}</div>`
@@ -565,11 +627,11 @@ VIEWS.customerDetail = function(){
     <div class="card" style="margin-top:10px">
       <div class="li-title" style="font-size:17px">${esc(c.name)}
         <span class="badge ${c.status === 'ACTIVE' ? 'ok' : 'off'}">${c.status}</span></div>
+      ${c.customerCode ? `<div class="kv"><span class="k">Code</span><span class="v">${esc(c.customerCode)}</span></div>` : ''}
       <div class="kv"><span class="k">Mobile</span><span class="v">${esc(c.mobile || '—')}</span></div>
       <div class="kv"><span class="k">Email</span><span class="v">${esc(c.email || '—')}</span></div>
       <div class="kv"><span class="k">Address</span><span class="v">${esc(c.address || '—')}</span></div>
       <div class="kv"><span class="k">Company</span><span class="v">${esc(companyName(c.companyId) || '—')}</span></div>
-      <div class="kv"><span class="k">Code</span><span class="v">${esc(c.customerCode || '—')}</span></div>
       ${c.notes ? `<div class="kv"><span class="k">Notes</span><span class="v">${esc(c.notes)}</span></div>` : ''}
       <div class="btn-row">
         <button class="btn sm primary" data-action="edit-customer" data-id="${c.id}">Edit</button>
@@ -647,7 +709,7 @@ VIEWS.foodItems = function(){
             <div class="li-main">
               <div class="li-title">${esc(f.name)}
                 <span class="badge ${f.status === 'ACTIVE' ? 'ok' : 'off'}">${f.status === 'ACTIVE' ? 'Active' : 'Inactive'}</span></div>
-              <div class="li-sub">${esc(f.type)}</div>
+              <div class="li-sub">${f.itemCode ? esc(f.itemCode) + ' · ' : ''}${esc(f.type)}</div>
             </div>
             <div class="li-right">
               <div class="li-amount">${money(f.rate)}</div>
@@ -726,6 +788,29 @@ VIEWS.dailyEntry = function(){
 /* ---------- MONTHLY REGISTER ---------- */
 VIEWS.register = function(){
   const ym = state.ui.registerMonth;
+  return `
+    <div class="filters">
+      <input type="month" id="regMonth" value="${ym}">
+      <select id="regCompany">
+        <option value="all">All Companies</option>
+        ${state.data.companies.map(c => `<option value="${c.id}" ${state.ui.registerCompany === c.id ? 'selected':''}>${esc(c.companyName)}</option>`).join('')}
+      </select>
+      <div class="full"><input id="regSearch" type="search" placeholder="Search customer…" value="${esc(state.ui.registerSearch)}"></div>
+    </div>
+
+    <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+      <button class="btn sm ghost" data-action="export-register-excel">Export Excel/CSV</button>
+      <button class="btn sm ghost" data-action="export-register-pdf">Export PDF</button>
+      <button class="btn sm primary" data-action="share-monthly">Share Monthly Report</button>
+      <button class="btn sm ghost" data-action="nav" data-view="dailyEntry">Go to Daily Entry</button>
+    </div>
+
+    <div id="registerContent">${renderRegisterContent()}</div>
+  `;
+};
+
+function renderRegisterContent(){
+  const ym = state.ui.registerMonth;
   const { dim, rows, dayTotals, grand } = buildRegister(ym, state.ui.registerCompany, state.ui.registerSearch);
   const today = todayISO();
   const showZero = state.data.settings.registerEmpty === 'zero';
@@ -751,24 +836,7 @@ VIEWS.register = function(){
   const footDays = dayTotals.map(t => `<td class="num">${t ? num(t) : '·'}</td>`).join('');
 
   return `
-    <div class="filters">
-      <input type="month" id="regMonth" value="${ym}">
-      <select id="regCompany">
-        <option value="all">All Companies</option>
-        ${state.data.companies.map(c => `<option value="${c.id}" ${state.ui.registerCompany === c.id ? 'selected':''}>${esc(c.companyName)}</option>`).join('')}
-      </select>
-      <div class="full"><input id="regSearch" type="search" placeholder="Search customer…" value="${esc(state.ui.registerSearch)}"></div>
-    </div>
-
-    <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
-      <button class="btn sm ghost" data-action="export-register-excel">Export Excel/CSV</button>
-      <button class="btn sm ghost" data-action="export-register-pdf">Export PDF</button>
-      <button class="btn sm primary" data-action="share-monthly">Share Monthly Report</button>
-      <button class="btn sm ghost" data-action="nav" data-view="dailyEntry">Go to Daily Entry</button>
-    </div>
-
     <div class="section-title">${esc(monthLabel(ym))} · ${rows.length} customers · Total ${money(grand)}</div>
-
     ${rows.length ? `
     <div class="table-wrap">
       <table class="reg-table">
@@ -778,9 +846,9 @@ VIEWS.register = function(){
       </table>
     </div>
     <p class="hint">Scroll sideways for all days. Tap any amount to view, edit or delete that day's entry.</p>`
-    : '<div class="card empty"><p>No customers for this filter.</p></div>'}
+    : '<div class="card empty"><p>No customers with transactions for this month.</p></div>'}
   `;
-};
+}
 
 /* ---------- PAYMENTS ---------- */
 VIEWS.payments = function(){
@@ -805,7 +873,8 @@ VIEWS.payments = function(){
         <div class="list-item">
           <div class="li-main">
             <div class="li-title">${esc(customerName(p.customerId))}
-              <span class="badge info">${esc(p.paymentMode||'Cash')}</span></div>
+              <span class="badge info">${esc(p.paymentMode||'Cash')}</span>
+              ${p.paymentCode ? `<span class="badge">${esc(p.paymentCode)}</span>` : ''}</div>
             <div class="li-sub">${esc(dateLabel(p.paymentDate))}${paymentRefText(p)}</div>
           </div>
           <div class="li-right">
@@ -845,7 +914,7 @@ VIEWS.bills = function(){
           <div class="li-main">
             <div class="li-title">${esc(b.type === 'COMPANY' ? (b.companyName || 'Company') : (b.customerName || 'Customer'))}
               <span class="badge ${b.type === 'COMPANY' ? 'info' : 'ok'}">${b.type === 'COMPANY' ? 'Company' : 'Customer'}</span></div>
-            <div class="li-sub">${esc(b.periodLabel || b.period)} · ${esc(b.billNo || '')} · Paid ${money(paid)}</div>
+            <div class="li-sub">${esc(b.billNo || '')} · ${esc(b.periodLabel || b.period)} · Paid ${money(paid)}</div>
           </div>
           <div class="li-right">
             <div class="li-amount">${money(b.total)}</div>
@@ -1045,12 +1114,13 @@ function reportPaymentReport(){
   if (!rows.length) return '<div class="card empty"><p>No payments in this range.</p></div>';
   return `<div class="section-title">${esc(dateLabel(from))} → ${esc(dateLabel(to))}</div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Date</th><th>Customer</th><th>Mode</th><th>Ref</th><th class="num">Amount</th></tr></thead>
+    <thead><tr><th>Date</th><th>Code</th><th>Customer</th><th>Mode</th><th>Ref</th><th class="num">Amount</th></tr></thead>
     <tbody>${rows.map(p => `<tr><td>${esc(dateLabel(p.paymentDate))}</td>
+      <td>${esc(p.paymentCode||'')}</td>
       <td>${esc(customerName(p.customerId))}</td><td>${esc(p.paymentMode||'')}</td>
       <td>${esc(p.reference||p.upiTransactionId||p.bankReference||p.chequeNumber||'')}</td>
       <td class="num">${num(p.amount)}</td></tr>`).join('')}</tbody>
-    <tfoot><tr><th colspan="4">TOTAL</th><th class="num">${num(rows.reduce((s,p)=>s+(Number(p.amount)||0),0))}</th></tr></tfoot>
+    <tfoot><tr><th colspan="5">TOTAL</th><th class="num">${num(rows.reduce((s,p)=>s+(Number(p.amount)||0),0))}</th></tr></tfoot>
   </table></div>`;
 }
 
@@ -1065,7 +1135,7 @@ function reportCustStatement(){
   const paid = sumPayments(c.id, monthStart(ym), monthEnd(ym));
   return `<div class="card">
     <div class="li-title" style="font-size:16px">${esc(c.name)}</div>
-    <div class="li-sub">${esc(monthLabel(ym))} · ${esc(c.mobile||'')}</div>
+    <div class="li-sub">${c.customerCode ? esc(c.customerCode) + ' · ' : ''}${esc(monthLabel(ym))} · ${esc(c.mobile||'')}</div>
   </div>
   <div class="table-wrap"><table>
     <thead><tr><th>Date</th><th>Items</th><th class="num">Amount</th></tr></thead>
@@ -1112,30 +1182,18 @@ function reportCustPayments(){
   if (!rows.length) return '<div class="card empty"><p>No payments recorded for this customer.</p></div>';
   return `<div class="section-title">${esc(c.name)} — payment history</div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Date</th><th>Mode</th><th>Ref</th><th class="num">Amount</th></tr></thead>
-    <tbody>${rows.map(p => `<tr><td>${esc(dateLabel(p.paymentDate))}</td><td>${esc(p.paymentMode||'')}</td>
+    <thead><tr><th>Date</th><th>Code</th><th>Mode</th><th>Ref</th><th class="num">Amount</th></tr></thead>
+    <tbody>${rows.map(p => `<tr><td>${esc(dateLabel(p.paymentDate))}</td><td>${esc(p.paymentCode||'')}</td><td>${esc(p.paymentMode||'')}</td>
       <td>${esc(p.reference||p.upiTransactionId||p.bankReference||p.chequeNumber||'')}</td>
       <td class="num">${num(p.amount)}</td></tr>`).join('')}</tbody>
-    <tfoot><tr><th colspan="3">TOTAL</th><th class="num">${num(rows.reduce((s,p)=>s+(Number(p.amount)||0),0))}</th></tr></tfoot>
+    <tfoot><tr><th colspan="4">TOTAL</th><th class="num">${num(rows.reduce((s,p)=>s+(Number(p.amount)||0),0))}</th></tr></tfoot>
   </table></div>`;
 }
 
 /* ---------- BACKUP ---------- */
 VIEWS.backup = function(){
-  const D = state.data;
   const fsSupported = 'showDirectoryPicker' in window;
   return `
-    <div class="card">
-      <div class="section-title" style="margin-top:0">Current Data</div>
-      <div class="kv"><span class="k">Customers</span><span class="v">${D.customers.length}</span></div>
-      <div class="kv"><span class="k">Companies</span><span class="v">${D.companies.length}</span></div>
-      <div class="kv"><span class="k">Food Items</span><span class="v">${D.foodItems.length}</span></div>
-      <div class="kv"><span class="k">Daily Entries</span><span class="v">${D.dailyEntries.length}</span></div>
-      <div class="kv"><span class="k">Entry Items</span><span class="v">${D.dailyEntryItems.length}</span></div>
-      <div class="kv"><span class="k">Payments</span><span class="v">${D.payments.length}</span></div>
-      <div class="kv"><span class="k">Bills</span><span class="v">${D.bills.length}</span></div>
-    </div>
-
     <div class="section-title">Backup</div>
     <div class="card">
       <button class="btn primary block" data-action="export-backup">⬇ Export Backup (${CFG.BACKUP_FILE})</button>
@@ -1143,7 +1201,7 @@ VIEWS.backup = function(){
       ${fsSupported
         ? `<button class="btn ghost block" data-action="save-folder">📁 Save to Folder (File System Access)</button>
            <p class="hint">${folderHandle() ? 'Folder connected: <b>' + esc(folderName()) + '</b>' : 'No folder connected yet.'}</p>`
-        : `<p class="hint">Your browser does not support the File System Access API. Use “Export Backup” and save the file manually into your Barkat/Data folder.</p>`}
+        : `<p class="hint">Your browser does not support the File System Access API. Use "Export Backup" and save the file manually into your Barkat/Data folder.</p>`}
     </div>
 
     <div class="section-title">Restore</div>
@@ -1162,9 +1220,13 @@ VIEWS.backup = function(){
   `;
 };
 
-/* ---------- SETTINGS ---------- */
+/* ---------- SETTINGS (with Developer Tools) ---------- */
 VIEWS.settings = function(){
   const s = state.data.settings;
+  const t = s.theme || {};
+  const devMode = !!s.developerMode;
+  const D = state.data;
+  const seq = Object.assign({ customer:0, foodItem:0, bill:0, payment:0 }, s.sequences || {});
   return `
     <form id="settingsForm" class="card">
       <div class="field"><label>Business Name</label>
@@ -1182,20 +1244,66 @@ VIEWS.settings = function(){
           <input name="defaultTiffinRate" type="number" min="0" step="1" value="${esc(s.defaultTiffinRate)}"></div>
         <div class="field"><label>Monthly Register Empty Cells</label>
           <select name="registerEmpty">
-            <option value="blank" ${s.registerEmpty === 'blank' ? 'selected' : ''}>Show “·” (blank)</option>
-            <option value="zero" ${s.registerEmpty === 'zero' ? 'selected' : ''}>Show “0”</option>
+            <option value="blank" ${s.registerEmpty === 'blank' ? 'selected' : ''}>Show "·" (blank)</option>
+            <option value="zero" ${s.registerEmpty === 'zero' ? 'selected' : ''}>Show "0"</option>
           </select></div>
       </div>
       <button class="btn primary block" type="submit">Save Settings</button>
     </form>
 
-    <div class="section-title">Demo Data</div>
+    <div class="section-title">Developer Tools</div>
     <div class="card">
-      <button class="btn ghost block" data-action="seed-demo">Load Demo Data</button>
-      <div style="height:8px"></div>
-      <button class="btn danger ghost block" data-action="clear-demo">Clear Demo Data</button>
-      <p class="hint">Demo data is created only once (tracked in settings) and never recreated after refresh.</p>
+      <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+        <input type="checkbox" id="devModeToggle" ${devMode ? 'checked' : ''} style="width:auto;min-height:auto">
+        <span style="font-weight:600">Enable Developer Mode</span>
+      </label>
+      <p class="hint">When enabled, shows Current Data counts, sequence trackers, theme customization, and the backup icon in the top bar.</p>
     </div>
+
+    ${devMode ? `
+      <div class="section-title">Current Data</div>
+      <div class="card">
+        <div class="kv"><span class="k">Customers</span><span class="v">${D.customers.length}</span></div>
+        <div class="kv"><span class="k">Companies</span><span class="v">${D.companies.length}</span></div>
+        <div class="kv"><span class="k">Food Items</span><span class="v">${D.foodItems.length}</span></div>
+        <div class="kv"><span class="k">Daily Entries</span><span class="v">${D.dailyEntries.length}</span></div>
+        <div class="kv"><span class="k">Entry Items</span><span class="v">${D.dailyEntryItems.length}</span></div>
+        <div class="kv"><span class="k">Payments</span><span class="v">${D.payments.length}</span></div>
+        <div class="kv"><span class="k">Bills</span><span class="v">${D.bills.length}</span></div>
+      </div>
+
+      <div class="section-title">Next Sequence Numbers</div>
+      <div class="card">
+        <div class="kv"><span class="k">Customer</span><span class="v">${CODE_PREFIX.customer}-${String((seq.customer||0)+1).padStart(4,'0')}</span></div>
+        <div class="kv"><span class="k">Food Item</span><span class="v">${CODE_PREFIX.foodItem}-${String((seq.foodItem||0)+1).padStart(4,'0')}</span></div>
+        <div class="kv"><span class="k">Bill</span><span class="v">${CODE_PREFIX.bill}-${String((seq.bill||0)+1).padStart(4,'0')}</span></div>
+        <div class="kv"><span class="k">Payment</span><span class="v">${CODE_PREFIX.payment}-${String((seq.payment||0)+1).padStart(4,'0')}</span></div>
+      </div>
+
+      <div class="section-title">Theme Colors</div>
+      <form id="themeForm" class="card">
+        <div class="field"><label>Primary (buttons)</label>
+          <input type="color" name="primary" value="${esc(t.primary || '#0f766e')}"></div>
+        <div class="row2">
+          <div class="field"><label>Primary Dark</label>
+            <input type="color" name="primaryDark" value="${esc(t.primaryDark || '#115e59')}"></div>
+          <div class="field"><label>Primary Light</label>
+            <input type="color" name="primaryLight" value="${esc(t.primaryLight || '#ccfbf1')}"></div>
+        </div>
+        <div class="field"><label>Background</label>
+          <input type="color" name="bg" value="${esc(t.bg || '#f1f5f6')}"></div>
+        <button class="btn primary block" type="submit">Save Theme</button>
+        <button class="btn ghost block" type="button" data-action="reset-theme" style="margin-top:8px">Reset to Default</button>
+      </form>
+
+      <div class="section-title">Demo Data</div>
+      <div class="card">
+        <button class="btn ghost block" data-action="seed-demo">Load Demo Data</button>
+        <div style="height:8px"></div>
+        <button class="btn danger ghost block" data-action="clear-demo">Clear Demo Data</button>
+        <p class="hint">Demo data is created only once (tracked in settings) and never recreated after refresh.</p>
+      </div>
+    ` : ''}
 
     <div class="section-title">About</div>
     <div class="card">
@@ -1226,7 +1334,8 @@ function openCustomerForm(id){
           ${companies.map(co => `<option value="${co.id}" ${c && c.companyId === co.id ? 'selected' : ''}>${esc(co.companyName)}</option>`).join('')}
         </select></div>
       <div class="row2">
-        <div class="field"><label>Customer Code</label><input name="customerCode" value="${esc(c ? c.customerCode : '')}"></div>
+        <div class="field"><label>Customer Code</label>
+          <input name="customerCode" value="${esc(c ? c.customerCode : '')}" placeholder="auto-generate if blank"></div>
         <div class="field"><label>Status</label>
           <select name="status">
             <option value="ACTIVE" ${!c || c.status === 'ACTIVE' ? 'selected' : ''}>ACTIVE</option>
@@ -1234,6 +1343,7 @@ function openCustomerForm(id){
           </select></div>
       </div>
       <div class="field"><label>Notes</label><textarea name="notes">${esc(c ? c.notes : '')}</textarea></div>
+      <p class="hint">If you leave the Customer Code blank, a sequential code (CUST-0001, CUST-0002…) is generated automatically.</p>
     </form>
   `, `<button class="btn ghost" data-action="close-modal">Cancel</button>
       <button class="btn primary" data-action="save-customer">Save Customer</button>`);
@@ -1279,11 +1389,15 @@ function openFoodForm(id){
             ${FOOD_TYPES.map(t => `<option value="${t}" ${f && f.type === t ? 'selected' : ''}>${t}</option>`).join('')}
           </select></div>
       </div>
-      <div class="field"><label>Status</label>
-        <select name="status">
-          <option value="ACTIVE" ${!f || f.status === 'ACTIVE' ? 'selected' : ''}>ACTIVE</option>
-          <option value="INACTIVE" ${f && f.status === 'INACTIVE' ? 'selected' : ''}>INACTIVE</option>
-        </select></div>
+      <div class="row2">
+        <div class="field"><label>Item Code</label>
+          <input name="itemCode" value="${esc(f ? (f.itemCode||'') : '')}" placeholder="auto-generate if blank"></div>
+        <div class="field"><label>Status</label>
+          <select name="status">
+            <option value="ACTIVE" ${!f || f.status === 'ACTIVE' ? 'selected' : ''}>ACTIVE</option>
+            <option value="INACTIVE" ${f && f.status === 'INACTIVE' ? 'selected' : ''}>INACTIVE</option>
+          </select></div>
+      </div>
       <p class="hint">MEAL = main tiffin/dinner. EXTRA = chapati, tea, rice. OTHER = anything else.</p>
     </form>
   `, `<button class="btn ghost" data-action="close-modal">Cancel</button>
@@ -1311,7 +1425,6 @@ function itemRowHtml(item){
     rate = item.rate;
     name = item.foodItemNameSnapshot;
   } else {
-    // Default to the first active food item so rate & amount show immediately
     const first = state.data.foodItems.find(f => f.status !== 'INACTIVE');
     fid  = first ? first.id   : '';
     qty  = 1;
@@ -1440,7 +1553,6 @@ async function saveEntryFromModal(){
   toast(existing ? 'Entry updated' : 'Entry saved', 'ok');
   await refresh();
 
-  // Show WhatsApp prompt only if delivered and customer exists
   if (status === 'DELIVERED'){
     setTimeout(() => showDailyWhatsAppPrompt(customerId, date), 80);
   }
@@ -1509,6 +1621,7 @@ function buildDailyEntryMessage(customer, date, items, total){
   lines.push('Date: ' + dateLabel(date));
   lines.push('');
   lines.push('Customer: ' + customer.name);
+  if (customer.customerCode) lines.push('Code: ' + customer.customerCode);
   lines.push('');
   if (items.length){
     items.forEach(it => {
@@ -1523,25 +1636,6 @@ function buildDailyEntryMessage(customer, date, items, total){
   lines.push('');
   lines.push('Thank you.');
   return lines.join('\n');
-}
-
-function buildMonthlyMessage(customer, period, total, paid, outstanding){
-  const s = state.data.settings;
-  return [
-    s.businessName || 'Barkat Tiffin Service',
-    '',
-    'Monthly Statement',
-    'Customer: ' + customer.name,
-    'Period: ' + monthLabel(period),
-    '',
-    'Total Charges: ' + money(total),
-    'Paid: ' + money(paid),
-    'Outstanding: ' + money(outstanding),
-    '',
-    'Detailed monthly report is available as PDF/Excel.',
-    '',
-    'Thank you.'
-  ].join('\n');
 }
 
 function openWhatsAppUrl(phone, message){
@@ -1625,7 +1719,7 @@ function paymentModeFieldsHtml(mode){
     return `<div class="field"><label>Reference</label>
       <input name="reference" placeholder="Any reference"></div>`;
   }
-  return ''; // Cash — no extra fields
+  return '';
 }
 
 function openPaymentForm(customerId){
@@ -1656,9 +1750,10 @@ function openPaymentForm(customerId){
       <div class="field"><label>Link to Bill (optional)</label>
         <select name="billId">
           <option value="">— None —</option>
-          ${unpaidBills.map(b => `<option value="${b.id}">${esc(b.customerName)} · ${esc(b.periodLabel||b.period)} · ${money(b.total - billPaid(b.id))} due</option>`).join('')}
+          ${unpaidBills.map(b => `<option value="${b.id}">${esc(b.customerName)} · ${esc(b.billNo||'')} · ${esc(b.periodLabel||b.period)} · ${money(b.total - billPaid(b.id))} due</option>`).join('')}
         </select></div>
       <div class="field"><label>Notes</label><input name="notes"></div>
+      <p class="hint">A sequential Payment Code will be auto-generated on save.</p>
     </form>
   `, `<button class="btn ghost" data-action="close-modal">Cancel</button>
       <button class="btn primary" data-action="save-payment">Save Payment</button>`);
@@ -1677,7 +1772,7 @@ function openBillGenerator(type){
       ${type === 'CUSTOMER' ? `
         <div class="field"><label>Customer *</label>
           <select name="customerId" required>
-            ${customers.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}
+            ${customers.map(c => `<option value="${c.id}">${esc(c.name)}${c.customerCode ? ' (' + esc(c.customerCode) + ')' : ''}</option>`).join('')}
           </select></div>` : `
         <div class="field"><label>Company *</label>
           <select name="companyId" required>
@@ -1685,7 +1780,7 @@ function openBillGenerator(type){
           </select></div>`}
       <div class="field"><label>Month *</label>
         <input name="period" type="month" required value="${state.ui.billMonth}"></div>
-      <p class="hint">The bill is a snapshot of the actual daily transactions for that month. Old bills never change when rates change later.</p>
+      <p class="hint">The bill is a snapshot of the actual daily transactions for that month. Old bills never change when rates change later. A sequential Bill Code is auto-generated.</p>
     </form>
   `, `<button class="btn ghost" data-action="close-modal">Cancel</button>
       <button class="btn primary" data-action="create-bill">Generate Bill</button>`);
@@ -1698,6 +1793,7 @@ async function createBill(){
   if (!period){ toast('Select a month', 'err'); return; }
   const periodLabel = monthLabel(period);
   const now = new Date().toISOString();
+  const billCode = await nextCode('bill');
 
   let bill;
 
@@ -1723,9 +1819,10 @@ async function createBill(){
     const total = lines.reduce((s,l) => s + l.amount, 0);
     bill = {
       id: uid(),
-      billNo: 'B-' + period.replace('-','') + '-' + (state.data.bills.length + 1),
+      billNo: billCode,
       type: 'CUSTOMER',
       customerId: c.id,
+      customerCode: c.customerCode || '',
       customerName: c.name,
       customerMobile: c.mobile || '',
       companyId: c.companyId || '',
@@ -1742,13 +1839,13 @@ async function createBill(){
     const lines = [];
     custs.forEach(c => {
       const amt = sumEntries(c.id, monthStart(period), monthEnd(period));
-      if (amt > 0) lines.push({ date: '', description: c.name, items: [], amount: amt, customerId: c.id });
+      if (amt > 0) lines.push({ date: '', description: c.name + (c.customerCode ? ' (' + c.customerCode + ')' : ''), items: [], amount: amt, customerId: c.id });
     });
     if (!lines.length){ toast('No transactions in that month', 'err'); return; }
     const total = lines.reduce((s,l) => s + l.amount, 0);
     bill = {
       id: uid(),
-      billNo: 'CB-' + period.replace('-','') + '-' + (state.data.bills.length + 1),
+      billNo: billCode,
       type: 'COMPANY',
       companyId: co.id,
       companyName: co.companyName,
@@ -1762,7 +1859,7 @@ async function createBill(){
 
   await dbPut('bills', bill);
   closeModal();
-  toast('Bill generated', 'ok');
+  toast('Bill generated: ' + billCode, 'ok');
   await refresh();
   viewBill(bill.id);
 }
@@ -1785,6 +1882,7 @@ function billHtml(bill){
     </div>
     <div class="kv"><span class="k">Bill No</span><span class="v">${esc(bill.billNo || '')}</span></div>
     <div class="kv"><span class="k">${bill.type === 'COMPANY' ? 'Company' : 'Customer'}</span><span class="v">${esc(bill.type === 'COMPANY' ? bill.companyName : bill.customerName)}</span></div>
+    ${bill.customerCode ? `<div class="kv"><span class="k">Customer Code</span><span class="v">${esc(bill.customerCode)}</span></div>` : ''}
     ${bill.customerMobile ? `<div class="kv"><span class="k">Mobile</span><span class="v">${esc(bill.customerMobile)}</span></div>` : ''}
     <div class="kv"><span class="k">Period</span><span class="v">${esc(bill.periodLabel || bill.period)}</span></div>
     <div style="height:10px"></div>
@@ -1929,7 +2027,6 @@ async function shareOrDownloadFile(blob, filename, title){
     }
   } catch(e){
     if (e && e.name === 'AbortError') return;
-    // fall through to download
   }
   downloadBlob(blob, filename, blob.type);
   toast('File downloaded: ' + filename, 'ok');
@@ -1966,12 +2063,13 @@ async function generateAndShareMonthly(){
     doc.text('Monthly Food Report', 40, 64);
     doc.setFontSize(10);
     doc.text('Customer: ' + c.name, 40, 86);
-    doc.text('Period: ' + monthLabel(period), 40, 100);
+    if (c.customerCode) doc.text('Code: ' + c.customerCode, 40, 100);
+    doc.text('Period: ' + monthLabel(period), 40, c.customerCode ? 114 : 100);
 
     doc.autoTable({
       head: [['Date','Food Details','Amount']],
       body: entries.map(e => [dayLabel(e.date), entrySummary(e), String(e.totalAmount)]),
-      startY: 118,
+      startY: c.customerCode ? 132 : 118,
       styles: { fontSize: 9 },
       headStyles: { fillColor: [15,118,110], textColor: 255 },
       columnStyles: { 2: { halign: 'right' } }
@@ -1989,11 +2087,10 @@ async function generateAndShareMonthly(){
     return;
   }
 
-  // Excel / CSV
   const aoa = [
     [s.businessName || 'Barkat Tiffin Service'],
     ['Monthly Food Report'],
-    ['Customer: ' + c.name],
+    ['Customer: ' + c.name + (c.customerCode ? ' (' + c.customerCode + ')' : '')],
     ['Period: ' + monthLabel(period)],
     [],
     ['Date','Food Details','Amount']
@@ -2192,6 +2289,8 @@ Restore this backup? This will REPLACE all data currently on this device.`;
   if (_dirHandle) await storeDirHandle(_dirHandle);
 
   await refresh();
+  await syncSequences();   /* Ensure sequences continue past imported codes */
+  applyTheme();            /* Re-apply theme + dev-mode class from imported settings */
   toast('Backup restored', 'ok');
 }
 
@@ -2203,6 +2302,7 @@ async function clearAllData(){
   await dbPut('settings', { key: 'app', value: Object.assign({}, DEFAULT_SETTINGS, { seeded: true }) });
   if (handle) await storeDirHandle(handle);
   await refresh();
+  applyTheme();
   toast('All data cleared', 'ok');
 }
 
@@ -2231,8 +2331,9 @@ async function seedDemoData(){
     { name: 'Sameer Shaikh', mobile: '9876543213', companyId: '' }
   ];
   for (const c of custs){
+    const code = await nextCode('customer');
     await dbPut('customers', {
-      id: uid(), customerCode: '', name: c.name, mobile: c.mobile, email: '',
+      id: uid(), customerCode: code, name: c.name, mobile: c.mobile, email: '',
       address: '', companyId: c.companyId, status: 'ACTIVE', notes: '',
       createdAt: now, updatedAt: now
     });
@@ -2247,8 +2348,9 @@ async function seedDemoData(){
     { name: 'Dal',            type: 'EXTRA', rate: 30 }
   ];
   for (const f of foods){
+    const code = await nextCode('foodItem');
     await dbPut('foodItems', {
-      id: uid(), name: f.name, type: f.type, rate: f.rate,
+      id: uid(), itemCode: code, name: f.name, type: f.type, rate: f.rate,
       status: 'ACTIVE', createdAt: now, updatedAt: now
     });
   }
@@ -2390,12 +2492,13 @@ async function exportBillPDF(billId){
   doc.setFontSize(10);
   doc.text('Bill No: ' + (bill.billNo || ''), 40, 78);
   doc.text((bill.type === 'COMPANY' ? 'Company: ' : 'Customer: ') + (bill.type === 'COMPANY' ? bill.companyName : bill.customerName), 40, 92);
-  doc.text('Period: ' + (bill.periodLabel || bill.period), 40, 106);
+  if (bill.customerCode) doc.text('Customer Code: ' + bill.customerCode, 40, 106);
+  doc.text('Period: ' + (bill.periodLabel || bill.period), 40, bill.customerCode ? 120 : 106);
 
   doc.autoTable({
     head: [['Date', 'Description', 'Amount']],
     body: bill.lines.map(l => [l.date ? dayLabel(l.date) : '', l.description, String(l.amount)]),
-    startY: 122,
+    startY: bill.customerCode ? 136 : 122,
     styles: { fontSize: 9 },
     headStyles: { fillColor: [15,118,110], textColor: 255 },
     columnStyles: { 2: { halign: 'right' } }
@@ -2420,7 +2523,6 @@ document.addEventListener('click', async (ev) => {
   const action = el.dataset.action;
 
   switch (action){
-    /* navigation */
     case 'nav':
       nav(el.dataset.view, el.dataset.id ? { id: el.dataset.id } : {});
       return;
@@ -2430,7 +2532,6 @@ document.addEventListener('click', async (ev) => {
     case 'confirm-yes':   closeConfirm(true); return;
     case 'confirm-no':    closeConfirm(false); return;
 
-    /* customers */
     case 'add-customer':  openCustomerForm(null); return;
     case 'edit-customer': openCustomerForm(el.dataset.id); return;
     case 'open-customer': nav('customerDetail', { id: el.dataset.id }); return;
@@ -2445,25 +2546,21 @@ document.addEventListener('click', async (ev) => {
       return;
     }
 
-    /* companies */
     case 'add-company':  openCompanyForm(null); return;
     case 'edit-company': openCompanyForm(el.dataset.id); return;
     case 'save-company': await saveCompanyForm(); return;
 
-    /* food items */
     case 'add-food':    openFoodForm(null); return;
     case 'edit-food':   openFoodForm(el.dataset.id); return;
     case 'save-food':   await saveFoodForm(); return;
     case 'toggle-food': await toggleFoodStatus(el.dataset.id); return;
     case 'delete-food': await deleteFoodPermanent(el.dataset.id); return;
 
-    /* customer detail tabs */
     case 'cust-tab':
       state.ui.custTab = el.dataset.tab;
       render();
       return;
 
-    /* daily entry */
     case 'entry-open': openEntryEditor(el.dataset.id, el.dataset.date); return;
     case 'open-entry-day': openEntryEditor(el.dataset.id, el.dataset.date); return;
     case 'entry-add-row': {
@@ -2490,7 +2587,6 @@ document.addEventListener('click', async (ev) => {
       return;
     }
 
-    /* WhatsApp */
     case 'wa-daily-prompt': {
       const id = el.dataset.id, date = el.dataset.date;
       sendDailyEntryWhatsApp(id, date);
@@ -2503,7 +2599,6 @@ document.addEventListener('click', async (ev) => {
       return;
     }
 
-    /* register */
     case 'reg-cell': openRegisterCell(el.dataset.id, el.dataset.date); return;
     case 'reg-edit': {
       const id = el.dataset.id, d = el.dataset.date;
@@ -2525,12 +2620,10 @@ document.addEventListener('click', async (ev) => {
     case 'share-monthly':         openShareMonthlyReport(); return;
     case 'share-monthly-generate': await generateAndShareMonthly(); return;
 
-    /* payments */
     case 'add-payment': openPaymentForm(el.dataset.id || null); return;
     case 'save-payment': await savePaymentForm(); return;
     case 'delete-payment': await deletePaymentById(el.dataset.id); return;
 
-    /* bills */
     case 'gen-customer-bill': openBillGenerator('CUSTOMER'); return;
     case 'gen-company-bill':  openBillGenerator('COMPANY'); return;
     case 'create-bill':       await createBill(); return;
@@ -2539,7 +2632,6 @@ document.addEventListener('click', async (ev) => {
     case 'print-bill':        window.print(); return;
     case 'pdf-bill':          await exportBillPDF(el.dataset.id); return;
 
-    /* backup */
     case 'export-backup': exportBackup(); return;
     case 'save-folder':   await saveToFolder(); return;
     case 'load-folder':   await loadFromFolder(); return;
@@ -2548,15 +2640,32 @@ document.addEventListener('click', async (ev) => {
     case 'seed-demo':     await seedDemoData(); return;
     case 'clear-demo':    await clearDemoData(); return;
 
+    case 'reset-theme': {
+      await saveSettings({ theme: Object.assign({}, DEFAULT_SETTINGS.theme) });
+      applyTheme();
+      toast('Theme reset to default', 'ok');
+      render();
+      return;
+    }
+
     default: return;
   }
 });
 
 document.addEventListener('input', (ev) => {
   const t = ev.target;
+
   if (t.id === 'custSearch'){ state.ui.custSearch = t.value; state.ui.focus = t.id; render(); return; }
   if (t.id === 'entrySearch'){ state.ui.entrySearch = t.value; state.ui.focus = t.id; render(); return; }
-  if (t.id === 'regSearch'){ state.ui.regSearch = t.value; state.ui.focus = t.id; render(); return; }
+
+  /* Register search: update only the table section to preserve focus/keyboard */
+  if (t.id === 'regSearch'){
+    state.ui.regSearch = t.value;
+    const content = document.getElementById('registerContent');
+    if (content) content.innerHTML = renderRegisterContent();
+    return;
+  }
+
   if (t.classList.contains('it-qty') || t.classList.contains('it-rate')){ recalcEntryModal(); return; }
 });
 
@@ -2565,8 +2674,21 @@ document.addEventListener('change', (ev) => {
 
   if (t.id === 'entryDate'){ state.ui.entryDate = t.value; render(); return; }
   if (t.id === 'entryCompany'){ state.ui.entryCompany = t.value; render(); return; }
-  if (t.id === 'regMonth'){ state.ui.registerMonth = t.value || currentMonth(); render(); return; }
-  if (t.id === 'regCompany'){ state.ui.registerCompany = t.value; render(); return; }
+
+  /* Register: update only table section */
+  if (t.id === 'regMonth'){
+    state.ui.registerMonth = t.value || currentMonth();
+    const content = document.getElementById('registerContent');
+    if (content) content.innerHTML = renderRegisterContent();
+    return;
+  }
+  if (t.id === 'regCompany'){
+    state.ui.registerCompany = t.value;
+    const content = document.getElementById('registerContent');
+    if (content) content.innerHTML = renderRegisterContent();
+    return;
+  }
+
   if (t.id === 'custMonth'){ state.ui.custMonth = t.value || currentMonth(); render(); return; }
   if (t.id === 'payMonth'){ state.ui.payMonth = t.value || currentMonth(); render(); return; }
 
@@ -2578,7 +2700,16 @@ document.addEventListener('change', (ev) => {
 
   if (t.id === 'entryStatus'){ recalcEntryModal(); return; }
 
-  /* dynamic payment mode fields */
+  if (t.id === 'devModeToggle'){
+    (async () => {
+      await saveSettings({ developerMode: t.checked });
+      applyTheme();   /* toggles body.dev-mode → shows/hides backup icon */
+      toast(t.checked ? 'Developer mode enabled' : 'Developer mode disabled', 'ok');
+      render();
+    })();
+    return;
+  }
+
   if (t.id === 'payModeSelect'){
     const mode = t.value;
     const container = $('#payModeFields');
@@ -2617,7 +2748,23 @@ document.addEventListener('submit', async (ev) => {
       defaultTiffinRate: Number(f.defaultTiffinRate.value) || 0,
       registerEmpty: f.registerEmpty.value
     });
+    applyTheme();   /* keep body class / colors in sync */
     toast('Settings saved', 'ok');
+    render();
+  }
+
+  if (ev.target.id === 'themeForm'){
+    ev.preventDefault();
+    const f = ev.target;
+    const theme = {
+      primary: f.primary.value,
+      primaryDark: f.primaryDark.value,
+      primaryLight: f.primaryLight.value,
+      bg: f.bg.value
+    };
+    await saveSettings({ theme });
+    applyTheme();
+    toast('Theme updated', 'ok');
     render();
   }
 });
@@ -2627,11 +2774,10 @@ async function saveCustomerForm(){
   const f = $('#customerForm');
   if (!f) return;
   if (!f.reportValidity()) return;
-  const id = f.id.value || uid();
   const existing = f.id.value ? customerById(f.id.value) : null;
   const now = new Date().toISOString();
   const obj = {
-    id,
+    id: f.id.value || uid(),
     customerCode: f.customerCode.value.trim(),
     name: f.name.value.trim(),
     mobile: f.mobile.value.trim(),
@@ -2643,6 +2789,9 @@ async function saveCustomerForm(){
     createdAt: existing ? existing.createdAt : now,
     updatedAt: now
   };
+  if (!obj.customerCode && (!existing || !existing.customerCode)){
+    obj.customerCode = await nextCode('customer');
+  }
   await dbPut('customers', obj);
   closeModal();
   toast(existing ? 'Customer updated' : 'Customer added', 'ok');
@@ -2692,6 +2841,7 @@ async function saveFoodForm(){
   const now = new Date().toISOString();
   const obj = {
     id: f.id.value || uid(),
+    itemCode: f.itemCode ? f.itemCode.value.trim() : '',
     name: f.name.value.trim(),
     type: f.type.value,
     rate: Number(f.rate.value) || 0,
@@ -2699,6 +2849,9 @@ async function saveFoodForm(){
     createdAt: existing ? existing.createdAt : now,
     updatedAt: now
   };
+  if (!obj.itemCode && (!existing || !existing.itemCode)){
+    obj.itemCode = await nextCode('foodItem');
+  }
   await dbPut('foodItems', obj);
   closeModal();
   toast(existing ? 'Food item updated' : 'Food item added', 'ok');
@@ -2715,8 +2868,11 @@ async function savePaymentForm(){
   if (amount <= 0){ toast('Enter a valid amount', 'err'); return; }
 
   const mode = f.paymentMode.value;
+  const paymentCode = await nextCode('payment');
+
   const obj = {
     id: uid(),
+    paymentCode,
     customerId: customer.id,
     companyId: customer.companyId || '',
     billId: f.billId.value || '',
@@ -2743,11 +2899,10 @@ async function savePaymentForm(){
   } else if (mode === 'Other'){
     obj.reference = (f.reference && f.reference.value || '').trim();
   }
-  /* Cash — no extra fields */
 
   await dbPut('payments', obj);
   closeModal();
-  toast('Payment recorded', 'ok');
+  toast('Payment recorded: ' + paymentCode, 'ok');
   await refresh();
 }
 
@@ -2796,6 +2951,8 @@ async function init(){
     await openDB();
     await loadAll();
     _dirHandle = await getStoredDirHandle();
+    await syncSequences();
+    applyTheme();            /* applies theme + body.dev-mode class */
     injectManifest();
     render();
     registerServiceWorker();
