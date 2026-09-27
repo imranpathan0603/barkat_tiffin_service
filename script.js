@@ -1,6 +1,9 @@
 /* ============================================================
-   BARKAT TIFFIN SERVICE — app.js
+   BARKAT TIFFIN SERVICE — script.js
    Offline-first tiffin management. IndexedDB + vanilla JS.
+   Updated: safe delete, dynamic payment form, WhatsApp share,
+   monthly report share, mobile-friendly buttons, default first
+   food item rate.
    ============================================================ */
 'use strict';
 
@@ -21,13 +24,13 @@ const DEFAULT_SETTINGS = {
   businessAddress: '',
   defaultTiffinRate: 80,
   currency: '₹',
-  registerEmpty: 'blank',   // 'blank' | 'zero'
+  registerEmpty: 'blank',
   seeded: false
 };
 
-const ENTRY_STATUS = ['DELIVERED','NOT_TAKEN','SKIPPED','CANCELLED'];
-const FOOD_TYPES   = ['MEAL','EXTRA','OTHER'];
-const PAYMENT_MODES= ['Cash','UPI','Bank Transfer','Other'];
+const ENTRY_STATUS  = ['DELIVERED','NOT_TAKEN','SKIPPED','CANCELLED'];
+const FOOD_TYPES    = ['MEAL','EXTRA','OTHER'];
+const PAYMENT_MODES = ['Cash','UPI','Bank Transfer','Cheque','Other'];
 
 /* ==========================
    SMALL UTILITIES
@@ -112,12 +115,14 @@ function openDB(){
 function st(name, mode='readonly'){ return _db.transaction(name, mode).objectStore(name); }
 function pr(req){ return new Promise((res, rej) => { req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error); }); }
 
-const dbAll   = (n)       => pr(st(n).getAll());
-const dbGet   = (n, k)    => pr(st(n).get(k));
-const dbPut   = (n, o)    => pr(st(n, 'readwrite').put(o));
-const dbDel   = (n, k)    => pr(st(n, 'readwrite').delete(k));
-const dbClear = (n)       => pr(st(n, 'readwrite').clear());
-const dbIdx   = (n, i, q) => pr(st(n).index(i).getAll(q));
+/* ---------- DB HELPERS (both names available for safety) ---------- */
+const dbAll    = (n)       => pr(st(n).getAll());
+const dbGet    = (n, k)    => pr(st(n).get(k));
+const dbPut    = (n, o)    => pr(st(n, 'readwrite').put(o));
+const dbDel    = (n, k)    => pr(st(n, 'readwrite').delete(k));
+const dbDelete = dbDel;                        // alias — required by all delete paths
+const dbClear  = (n)       => pr(st(n, 'readwrite').clear());
+const dbIdx    = (n, i, q) => pr(st(n).index(i).getAll(q));
 
 /* ==========================
    UI STATE
@@ -245,8 +250,7 @@ function entrySummary(entry){
     const label = (Number(it.quantity) > 1 ? it.quantity + ' × ' : '') + it.foodItemNameSnapshot;
     (t === 'MEAL' ? meals : extras).push(label);
   });
-  const all = meals.concat(extras);
-  return all.join(' + ') || '—';
+  return meals.concat(extras).join(' + ') || '—';
 }
 function salesInRange(from, to){
   return state.data.dailyEntries
@@ -259,7 +263,6 @@ function paymentsInRange(from, to){
     .reduce((s, p) => s + (Number(p.amount) || 0), 0);
 }
 
-/* Monthly register matrix — always generated from live transactions */
 function buildRegister(ym, companyId, search){
   const dim = daysInMonth(ym);
   let customers = state.data.customers.slice();
@@ -524,12 +527,15 @@ VIEWS.customerDetail = function(){
   let tabHtml = '';
   if (tab === 'daily'){
     tabHtml = entries.length ? `<div class="card tight">${entries.map(e => `
-      <div class="list-item" data-action="open-entry-day" data-id="${c.id}" data-date="${e.date}">
-        <div class="li-main">
+      <div class="list-item">
+        <div class="li-main" data-action="open-entry-day" data-id="${c.id}" data-date="${e.date}">
           <div class="li-title">${esc(dateLabel(e.date))}</div>
           <div class="li-sub">${esc(entrySummary(e))}</div>
         </div>
-        <div class="li-right"><div class="li-amount">${money(e.totalAmount)}</div></div>
+        <div class="li-right">
+          <div class="li-amount">${money(e.totalAmount)}</div>
+          <button class="btn sm ghost" data-action="wa-entry" data-id="${c.id}" data-date="${e.date}">WA</button>
+        </div>
       </div>`).join('')}</div>`
       : '<div class="card empty"><p>No entries this month.</p></div>';
   } else if (tab === 'bills'){
@@ -547,7 +553,7 @@ VIEWS.customerDetail = function(){
       <div class="list-item">
         <div class="li-main">
           <div class="li-title">${money(p.amount)} <span class="badge info">${esc(p.paymentMode||'')}</span></div>
-          <div class="li-sub">${esc(dateLabel(p.paymentDate))}${p.reference ? ' • ' + esc(p.reference) : ''}</div>
+          <div class="li-sub">${esc(dateLabel(p.paymentDate))}${p.reference ? ' • ' + esc(p.reference) : ''}${p.upiTransactionId ? ' • UPI: ' + esc(p.upiTransactionId) : ''}${p.chequeNumber ? ' • Chq: ' + esc(p.chequeNumber) : ''}</div>
         </div>
         <div class="li-right"><button class="btn sm danger ghost" data-action="delete-payment" data-id="${p.id}">Delete</button></div>
       </div>`).join('')}</div>`
@@ -565,11 +571,14 @@ VIEWS.customerDetail = function(){
       <div class="kv"><span class="k">Company</span><span class="v">${esc(companyName(c.companyId) || '—')}</span></div>
       <div class="kv"><span class="k">Code</span><span class="v">${esc(c.customerCode || '—')}</span></div>
       ${c.notes ? `<div class="kv"><span class="k">Notes</span><span class="v">${esc(c.notes)}</span></div>` : ''}
-      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+      <div class="btn-row">
         <button class="btn sm primary" data-action="edit-customer" data-id="${c.id}">Edit</button>
+        ${c.mobile ? `<a class="btn sm ghost link" href="tel:${esc(c.mobile)}">📞 Call</a>
+          <button class="btn sm ghost" data-action="wa-customer" data-id="${c.id}">WhatsApp</button>` : ''}
         <button class="btn sm ghost" data-action="add-payment" data-id="${c.id}">+ Payment</button>
         <button class="btn sm ${c.status === 'ACTIVE' ? 'danger ghost' : 'ghost'}" data-action="toggle-customer" data-id="${c.id}">
           ${c.status === 'ACTIVE' ? 'Deactivate' : 'Activate'}</button>
+        <button class="btn sm danger ghost" data-action="delete-customer" data-id="${c.id}">Delete</button>
       </div>
     </div>
 
@@ -642,7 +651,12 @@ VIEWS.foodItems = function(){
             </div>
             <div class="li-right">
               <div class="li-amount">${money(f.rate)}</div>
-              <button class="btn sm ghost" data-action="edit-food" data-id="${f.id}">Edit</button>
+              <div class="food-actions">
+                <button class="btn sm ghost" data-action="edit-food" data-id="${f.id}">Edit</button>
+                <button class="btn sm ghost" data-action="toggle-food" data-id="${f.id}">
+                  ${f.status === 'ACTIVE' ? 'Deactivate' : 'Activate'}</button>
+                <button class="btn sm danger ghost" data-action="delete-food" data-id="${f.id}">Delete</button>
+              </div>
             </div>
           </div>`).join('')}</div>`;
     }).join('')}
@@ -749,6 +763,7 @@ VIEWS.register = function(){
     <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
       <button class="btn sm ghost" data-action="export-register-excel">Export Excel/CSV</button>
       <button class="btn sm ghost" data-action="export-register-pdf">Export PDF</button>
+      <button class="btn sm primary" data-action="share-monthly">Share Monthly Report</button>
       <button class="btn sm ghost" data-action="nav" data-view="dailyEntry">Go to Daily Entry</button>
     </div>
 
@@ -791,7 +806,7 @@ VIEWS.payments = function(){
           <div class="li-main">
             <div class="li-title">${esc(customerName(p.customerId))}
               <span class="badge info">${esc(p.paymentMode||'Cash')}</span></div>
-            <div class="li-sub">${esc(dateLabel(p.paymentDate))}${p.reference ? ' • ' + esc(p.reference) : ''}${p.notes ? ' • ' + esc(p.notes) : ''}</div>
+            <div class="li-sub">${esc(dateLabel(p.paymentDate))}${paymentRefText(p)}</div>
           </div>
           <div class="li-right">
             <div class="li-amount">${money(p.amount)}</div>
@@ -802,6 +817,16 @@ VIEWS.payments = function(){
     </div>
   `;
 };
+
+function paymentRefText(p){
+  const parts = [];
+  if (p.reference) parts.push(p.reference);
+  if (p.upiTransactionId) parts.push('UPI: ' + p.upiTransactionId);
+  if (p.bankReference) parts.push('Bank: ' + p.bankReference);
+  if (p.chequeNumber) parts.push('Chq: ' + p.chequeNumber);
+  if (p.notes) parts.push(p.notes);
+  return parts.length ? ' • ' + parts.map(esc).join(' • ') : '';
+}
 
 /* ---------- BILLS ---------- */
 VIEWS.bills = function(){
@@ -1023,7 +1048,8 @@ function reportPaymentReport(){
     <thead><tr><th>Date</th><th>Customer</th><th>Mode</th><th>Ref</th><th class="num">Amount</th></tr></thead>
     <tbody>${rows.map(p => `<tr><td>${esc(dateLabel(p.paymentDate))}</td>
       <td>${esc(customerName(p.customerId))}</td><td>${esc(p.paymentMode||'')}</td>
-      <td>${esc(p.reference||'')}</td><td class="num">${num(p.amount)}</td></tr>`).join('')}</tbody>
+      <td>${esc(p.reference||p.upiTransactionId||p.bankReference||p.chequeNumber||'')}</td>
+      <td class="num">${num(p.amount)}</td></tr>`).join('')}</tbody>
     <tfoot><tr><th colspan="4">TOTAL</th><th class="num">${num(rows.reduce((s,p)=>s+(Number(p.amount)||0),0))}</th></tr></tfoot>
   </table></div>`;
 }
@@ -1088,7 +1114,8 @@ function reportCustPayments(){
   <div class="table-wrap"><table>
     <thead><tr><th>Date</th><th>Mode</th><th>Ref</th><th class="num">Amount</th></tr></thead>
     <tbody>${rows.map(p => `<tr><td>${esc(dateLabel(p.paymentDate))}</td><td>${esc(p.paymentMode||'')}</td>
-      <td>${esc(p.reference||'')}</td><td class="num">${num(p.amount)}</td></tr>`).join('')}</tbody>
+      <td>${esc(p.reference||p.upiTransactionId||p.bankReference||p.chequeNumber||'')}</td>
+      <td class="num">${num(p.amount)}</td></tr>`).join('')}</tbody>
     <tfoot><tr><th colspan="3">TOTAL</th><th class="num">${num(rows.reduce((s,p)=>s+(Number(p.amount)||0),0))}</th></tr></tfoot>
   </table></div>`;
 }
@@ -1277,10 +1304,20 @@ function foodOptionsHtml(selectedId, fallbackName){
 }
 
 function itemRowHtml(item){
-  const fid = item ? item.foodItemId : '';
-  const qty = item ? item.quantity : 1;
-  const rate = item ? item.rate : '';
-  const name = item ? item.foodItemNameSnapshot : '';
+  let fid, qty, rate, name;
+  if (item){
+    fid  = item.foodItemId;
+    qty  = item.quantity;
+    rate = item.rate;
+    name = item.foodItemNameSnapshot;
+  } else {
+    // Default to the first active food item so rate & amount show immediately
+    const first = state.data.foodItems.find(f => f.status !== 'INACTIVE');
+    fid  = first ? first.id   : '';
+    qty  = 1;
+    rate = first ? first.rate : '';
+    name = first ? first.name : '';
+  }
   const amount = (Number(qty)||0) * (Number(rate)||0);
   return `<div class="item-row">
     <select class="it-food">${foodOptionsHtml(fid, name)}</select>
@@ -1385,7 +1422,6 @@ async function saveEntryFromModal(){
   };
   await dbPut('dailyEntries', entryObj);
 
-  // replace items (preserve nothing — snapshot is stored per item)
   const old = await dbIdx('dailyEntryItems', 'by_entry', entryId);
   for (const o of old) await dbDelete('dailyEntryItems', o.id);
   for (const it of items){
@@ -1403,18 +1439,26 @@ async function saveEntryFromModal(){
   closeModal();
   toast(existing ? 'Entry updated' : 'Entry saved', 'ok');
   await refresh();
+
+  // Show WhatsApp prompt only if delivered and customer exists
+  if (status === 'DELIVERED'){
+    setTimeout(() => showDailyWhatsAppPrompt(customerId, date), 80);
+  }
 }
 
 async function deleteEntry(customerId, date){
   const entry = state.index.entryMap.get(customerId + '|' + date);
   if (!entry) return;
-  const ok = await askConfirm(`Delete the entry for ${customerName(customerId)} on ${dateLabel(date)}?`, 'Delete');
+  const ok = await askConfirm(
+    `Delete Daily Entry?\n\nCustomer: ${customerName(customerId)}\nDate: ${dateLabel(date)}\nAmount: ${money(entry.totalAmount)}\n\nThis will remove the daily food record.`,
+    'Delete'
+  );
   if (!ok) return;
   const items = await dbIdx('dailyEntryItems', 'by_entry', entry.id);
   for (const it of items) await dbDelete('dailyEntryItems', it.id);
   await dbDelete('dailyEntries', entry.id);
   closeModal();
-  toast('Entry deleted', 'ok');
+  toast('Daily entry deleted', 'ok');
   await refresh();
 }
 
@@ -1438,12 +1482,152 @@ function openRegisterCell(customerId, date){
     ${entry.notes ? `<p class="hint">Notes: ${esc(entry.notes)}</p>` : ''}
   `, `
     <button class="btn danger ghost" data-action="reg-delete" data-id="${customerId}" data-date="${date}">Delete</button>
+    <button class="btn ghost" data-action="reg-whatsapp" data-id="${customerId}" data-date="${date}">WhatsApp</button>
     <button class="btn ghost" data-action="close-modal">Close</button>
     <button class="btn primary" data-action="reg-edit" data-id="${customerId}" data-date="${date}">Edit</button>
   `);
 }
 
+/* ---------- WHATSAPP HELPERS ---------- */
+function cleanPhoneForWhatsApp(phone){
+  if (!phone) return '';
+  let d = String(phone).replace(/\D/g, '');
+  if (!d) return '';
+  if (d.startsWith('00')) d = d.slice(2);
+  if (d.length === 12 && d.startsWith('91')) return d;
+  if (d.length === 11 && d.startsWith('0')) d = d.slice(1);
+  if (d.length === 10) return '91' + d;
+  return d;
+}
+
+function buildDailyEntryMessage(customer, date, items, total){
+  const s = state.data.settings;
+  const lines = [];
+  lines.push(s.businessName || 'Barkat Tiffin Service');
+  lines.push('');
+  lines.push('Daily Food Summary');
+  lines.push('Date: ' + dateLabel(date));
+  lines.push('');
+  lines.push('Customer: ' + customer.name);
+  lines.push('');
+  if (items.length){
+    items.forEach(it => {
+      const qty = ' × ' + (Number(it.quantity) || 0);
+      lines.push(it.foodItemNameSnapshot + qty + ' = ' + money(it.amount));
+    });
+  } else {
+    lines.push('(No items recorded)');
+  }
+  lines.push('');
+  lines.push('Total: ' + money(total));
+  lines.push('');
+  lines.push('Thank you.');
+  return lines.join('\n');
+}
+
+function buildMonthlyMessage(customer, period, total, paid, outstanding){
+  const s = state.data.settings;
+  return [
+    s.businessName || 'Barkat Tiffin Service',
+    '',
+    'Monthly Statement',
+    'Customer: ' + customer.name,
+    'Period: ' + monthLabel(period),
+    '',
+    'Total Charges: ' + money(total),
+    'Paid: ' + money(paid),
+    'Outstanding: ' + money(outstanding),
+    '',
+    'Detailed monthly report is available as PDF/Excel.',
+    '',
+    'Thank you.'
+  ].join('\n');
+}
+
+function openWhatsAppUrl(phone, message){
+  const cleaned = cleanPhoneForWhatsApp(phone);
+  if (!cleaned){ toast('Customer has no valid mobile number.', 'err'); return false; }
+  const url = 'https://wa.me/' + cleaned + '?text=' + encodeURIComponent(message);
+  window.open(url, '_blank');
+  return true;
+}
+
+function showDailyWhatsAppPrompt(customerId, date){
+  const c = customerById(customerId);
+  if (!c) return;
+  const entry = state.index.entryMap.get(customerId + '|' + date);
+  if (!entry) return;
+  const items = state.index.itemsByEntry.get(entry.id) || [];
+  const cleaned = cleanPhoneForWhatsApp(c.mobile);
+
+  if (!cleaned){
+    openModal('Entry Saved', `
+      <p>Customer has no valid mobile number.</p>
+      <div class="hint" style="margin-top:8px">${esc(c.name)} — ${esc(dateLabel(date))}</div>
+    `, `<button class="btn primary" data-action="close-modal">OK</button>`);
+    return;
+  }
+
+  const preview = items.length
+    ? items.map(it => `<div class="kv"><span class="k">${esc(it.foodItemNameSnapshot)}${it.quantity > 1 ? ' × ' + it.quantity : ''}</span><span class="v">${money(it.amount)}</span></div>`).join('')
+    : '<div class="kv"><span class="k">—</span><span class="v">—</span></div>';
+
+  openModal('Entry Saved', `
+    <p>Would you like to send today's order summary to <b>${esc(c.name)}</b>?</p>
+    <div class="card" style="box-shadow:none;border:1px solid var(--line);margin-top:10px">
+      ${preview}
+      <div class="entry-total"><span>Total</span><span class="val">${money(entry.totalAmount)}</span></div>
+    </div>
+  `, `
+    <button class="btn ghost" data-action="close-modal">Not Now</button>
+    <button class="btn primary" data-action="wa-daily-prompt" data-id="${customerId}" data-date="${date}">Send WhatsApp</button>
+  `);
+}
+
+function sendDailyEntryWhatsApp(customerId, date){
+  const c = customerById(customerId);
+  if (!c) return;
+  const entry = state.index.entryMap.get(customerId + '|' + date);
+  if (!entry) return;
+  const items = state.index.itemsByEntry.get(entry.id) || [];
+  const message = buildDailyEntryMessage(c, date, items, entry.totalAmount);
+  return openWhatsAppUrl(c.mobile, message);
+}
+
 /* ---------- PAYMENT ---------- */
+function paymentModeFieldsHtml(mode){
+  if (mode === 'UPI'){
+    return `
+      <div class="field"><label>UPI Transaction ID *</label>
+        <input name="upiTransactionId" placeholder="e.g. 1234567890" required></div>
+      <div class="field"><label>UPI App (optional)</label>
+        <input name="upiApp" placeholder="GPay / PhonePe / Paytm"></div>`;
+  }
+  if (mode === 'Bank Transfer'){
+    return `
+      <div class="field"><label>Bank Reference / Transaction ID *</label>
+        <input name="bankReference" required></div>
+      <div class="field"><label>Bank Name (optional)</label>
+        <input name="bankName"></div>`;
+  }
+  if (mode === 'Cheque'){
+    return `
+      <div class="row2">
+        <div class="field"><label>Cheque Number *</label>
+          <input name="chequeNumber" required></div>
+        <div class="field"><label>Cheque Date *</label>
+          <input name="chequeDate" type="date" required></div>
+      </div>
+      <div class="field"><label>Bank Name</label>
+        <input name="bankName"></div>`;
+  }
+  if (mode === 'Other'){
+    return `<div class="field"><label>Reference</label>
+      <input name="reference" placeholder="Any reference"></div>`;
+  }
+  return ''; // Cash — no extra fields
+}
+
 function openPaymentForm(customerId){
   const customers = state.data.customers.filter(c => c.status === 'ACTIVE' || c.id === customerId)
     .sort((a,b)=>(a.name||'').localeCompare(b.name||''));
@@ -1465,15 +1649,15 @@ function openPaymentForm(customerId){
           <input name="paymentDate" type="date" required value="${todayISO()}"></div>
       </div>
       <div class="field"><label>Mode</label>
-        <select name="paymentMode">
+        <select name="paymentMode" id="payModeSelect">
           ${PAYMENT_MODES.map(m => `<option value="${m}">${m}</option>`).join('')}
         </select></div>
+      <div id="payModeFields" class="payment-fields">${paymentModeFieldsHtml('Cash')}</div>
       <div class="field"><label>Link to Bill (optional)</label>
         <select name="billId">
           <option value="">— None —</option>
           ${unpaidBills.map(b => `<option value="${b.id}">${esc(b.customerName)} · ${esc(b.periodLabel||b.period)} · ${money(b.total - billPaid(b.id))} due</option>`).join('')}
         </select></div>
-      <div class="field"><label>Reference</label><input name="reference" placeholder="UPI ref / cheque no."></div>
       <div class="field"><label>Notes</label><input name="notes"></div>
     </form>
   `, `<button class="btn ghost" data-action="close-modal">Cancel</button>
@@ -1628,6 +1812,216 @@ function viewBill(id){
 }
 
 /* ==========================
+   SAFE DELETE HELPERS
+   ========================== */
+async function deleteCustomerPermanent(id){
+  const c = customerById(id);
+  if (!c){ toast('Customer not found', 'err'); return; }
+  const hasEntries  = state.data.dailyEntries.some(e => e.customerId === id);
+  const hasPayments = state.data.payments.some(p => p.customerId === id);
+  const hasBills    = state.data.bills.some(b => b.customerId === id);
+  if (hasEntries || hasPayments || hasBills){
+    toast('Customer has history — deactivate instead of delete.', 'err');
+    return;
+  }
+  const ok = await askConfirm(
+    `Permanently delete ${c.name}? This cannot be undone.`,
+    'Delete'
+  );
+  if (!ok) return;
+  await dbDelete('customers', id);
+  toast('Customer deleted successfully', 'ok');
+  nav('customers');
+}
+
+async function deleteFoodPermanent(id){
+  const f = foodItemById(id);
+  if (!f){ toast('Food item not found', 'err'); return; }
+  const used = state.data.dailyEntryItems.some(it => it.foodItemId === id);
+  if (used){
+    toast('Food item used in past entries — deactivate instead.', 'err');
+    return;
+  }
+  const ok = await askConfirm(
+    `Permanently delete "${f.name}"? This cannot be undone.`,
+    'Delete'
+  );
+  if (!ok) return;
+  await dbDelete('foodItems', id);
+  toast('Food item deleted successfully', 'ok');
+  await refresh();
+}
+
+async function toggleFoodStatus(id){
+  const f = foodItemById(id);
+  if (!f) return;
+  f.status = f.status === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE';
+  f.updatedAt = new Date().toISOString();
+  await dbPut('foodItems', f);
+  toast('Food item ' + (f.status === 'ACTIVE' ? 'activated' : 'deactivated'), 'ok');
+  await refresh();
+}
+
+async function deleteBillSafe(id){
+  const bill = state.data.bills.find(b => b.id === id);
+  if (!bill){ toast('Bill not found', 'err'); return; }
+  const linked = state.data.payments.filter(p => p.billId === id);
+  if (linked.length){
+    toast('Cannot delete: ' + linked.length + ' payment(s) linked to this bill.', 'err');
+    return;
+  }
+  const ok = await askConfirm('Delete this bill record? This cannot be undone.', 'Delete');
+  if (!ok) return;
+  await dbDelete('bills', id);
+  closeModal();
+  toast('Bill deleted successfully', 'ok');
+  await refresh();
+}
+
+async function deletePaymentById(id){
+  const p = state.data.payments.find(x => x.id === id);
+  if (!p){ toast('Payment not found', 'err'); return; }
+  const ok = await askConfirm(
+    `Delete this payment of ${money(p.amount)} for ${customerName(p.customerId)}? This cannot be undone.`,
+    'Delete'
+  );
+  if (!ok) return;
+  await dbDelete('payments', id);
+  toast('Payment deleted successfully', 'ok');
+  await refresh();
+}
+
+/* ==========================
+   MONTHLY SHARE
+   ========================== */
+function openShareMonthlyReport(){
+  const customers = state.data.customers.slice().sort((a,b)=>(a.name||'').localeCompare(b.name||''));
+  if (!customers.length){ toast('No customers yet', 'err'); return; }
+
+  openModal('Share Monthly Report', `
+    <div class="field"><label>Customer</label>
+      <select id="shareCustomer">
+        ${customers.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}
+      </select></div>
+    <div class="field"><label>Month</label>
+      <input type="month" id="shareMonth" value="${state.ui.registerMonth}"></div>
+    <div class="field"><label>Format</label>
+      <div style="display:flex;gap:16px;margin-top:6px">
+        <label style="display:flex;align-items:center;gap:6px">
+          <input type="radio" name="shareFmt" value="pdf" checked> PDF</label>
+        <label style="display:flex;align-items:center;gap:6px">
+          <input type="radio" name="shareFmt" value="excel"> Excel</label>
+      </div></div>
+    <p class="hint">The report uses actual transaction data for the selected customer and month.</p>
+  `, `
+    <button class="btn ghost" data-action="close-modal">Cancel</button>
+    <button class="btn primary" data-action="share-monthly-generate">Generate &amp; Share</button>
+  `);
+}
+
+async function shareOrDownloadFile(blob, filename, title){
+  try {
+    const file = new File([blob], filename, { type: blob.type || 'application/octet-stream' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })){
+      await navigator.share({ files: [file], title: title || filename, text: title || filename });
+      toast('Shared successfully', 'ok');
+      return;
+    }
+  } catch(e){
+    if (e && e.name === 'AbortError') return;
+    // fall through to download
+  }
+  downloadBlob(blob, filename, blob.type);
+  toast('File downloaded: ' + filename, 'ok');
+}
+
+async function generateAndShareMonthly(){
+  const customerId = $('#shareCustomer') ? $('#shareCustomer').value : '';
+  const period = $('#shareMonth') ? $('#shareMonth').value : '';
+  const fmtEl = document.querySelector('input[name="shareFmt"]:checked');
+  const fmt = fmtEl ? fmtEl.value : 'pdf';
+  const c = customerById(customerId);
+  if (!c || !period){ toast('Select customer and month', 'err'); return; }
+
+  const entries = state.data.dailyEntries
+    .filter(e => e.customerId === c.id && e.date.startsWith(period))
+    .sort((a,b) => a.date.localeCompare(b.date));
+
+  if (!entries.length){ toast('No data for that month', 'err'); return; }
+
+  const total = entries.reduce((s,e) => s + (Number(e.totalAmount)||0), 0);
+  const paid = sumPayments(c.id, monthStart(period), monthEnd(period));
+  const outstanding = total - paid;
+  const safeName = c.name.replace(/[^A-Za-z0-9]+/g,'-');
+  const s = state.data.settings;
+
+  if (fmt === 'pdf'){
+    const ok = await ensureJsPDF();
+    if (!ok){ toast('PDF library needs internet (CDN) once.', 'err'); return; }
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' });
+    doc.setFontSize(15);
+    doc.text(s.businessName || 'Barkat Tiffin Service', 40, 42);
+    doc.setFontSize(11);
+    doc.text('Monthly Food Report', 40, 64);
+    doc.setFontSize(10);
+    doc.text('Customer: ' + c.name, 40, 86);
+    doc.text('Period: ' + monthLabel(period), 40, 100);
+
+    doc.autoTable({
+      head: [['Date','Food Details','Amount']],
+      body: entries.map(e => [dayLabel(e.date), entrySummary(e), String(e.totalAmount)]),
+      startY: 118,
+      styles: { fontSize: 9 },
+      headStyles: { fillColor: [15,118,110], textColor: 255 },
+      columnStyles: { 2: { halign: 'right' } }
+    });
+    const endY = doc.lastAutoTable.finalY + 16;
+    doc.setFontSize(10);
+    doc.text('Monthly Total: ' + money(total), 40, endY);
+    doc.text('Paid: ' + money(paid), 40, endY + 14);
+    doc.text('Outstanding: ' + money(outstanding), 40, endY + 28);
+
+    const blob = doc.output('blob');
+    const fname = 'Barkat-' + safeName + '-' + period + '.pdf';
+    await shareOrDownloadFile(blob, fname, 'Monthly Report');
+    closeModal();
+    return;
+  }
+
+  // Excel / CSV
+  const aoa = [
+    [s.businessName || 'Barkat Tiffin Service'],
+    ['Monthly Food Report'],
+    ['Customer: ' + c.name],
+    ['Period: ' + monthLabel(period)],
+    [],
+    ['Date','Food Details','Amount']
+  ];
+  entries.forEach(e => aoa.push([dayLabel(e.date), entrySummary(e), e.totalAmount]));
+  aoa.push([]);
+  aoa.push(['Monthly Total', '', total]);
+  aoa.push(['Paid', '', paid]);
+  aoa.push(['Outstanding', '', outstanding]);
+
+  const ok = await ensureSheetJS();
+  if (ok){
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Report');
+    const buf = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+    const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const fname = 'Barkat-' + safeName + '-' + period + '.xlsx';
+    await shareOrDownloadFile(blob, fname, 'Monthly Report');
+  } else {
+    const csv = toCSV(aoa);
+    downloadBlob(csv, 'Barkat-' + safeName + '-' + period + '.csv', 'text/csv');
+    toast('CSV exported (offline mode)', 'ok');
+  }
+  closeModal();
+}
+
+/* ==========================
    BACKUP / RESTORE
    ========================== */
 let _dirHandle = null;
@@ -1665,7 +2059,9 @@ function buildBackupObject(){
 }
 
 function downloadBlob(content, filename, type){
-  const blob = new Blob([content], { type: type || 'application/json' });
+  const blob = (content instanceof Blob)
+    ? content
+    : new Blob([content], { type: type || 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = filename;
@@ -1772,15 +2168,12 @@ Restore this backup? This will REPLACE all data currently on this device.`;
   const ok = await askConfirm(summary, 'Restore');
   if (!ok) return;
 
-  const D = state.data;
-  const keepSettings = Object.assign({}, D.settings);
+  const keepSettings = Object.assign({}, state.data.settings);
 
   await Promise.all(CFG.STORES.map(n => dbClear(n)));
 
   const putAll = async (storeName, arr) => {
-    for (const item of (arr || [])){
-      await dbPut(storeName, item);
-    }
+    for (const item of (arr || [])) await dbPut(storeName, item);
   };
   await putAll('customers', obj.customers);
   await putAll('companies', obj.companies);
@@ -1790,7 +2183,6 @@ Restore this backup? This will REPLACE all data currently on this device.`;
   await putAll('payments', obj.payments);
   await putAll('bills', obj.bills);
 
-  // settings
   let newSettings = keepSettings;
   if (Array.isArray(obj.settings) && obj.settings.length){
     newSettings = Object.assign({}, DEFAULT_SETTINGS);
@@ -2044,6 +2436,14 @@ document.addEventListener('click', async (ev) => {
     case 'open-customer': nav('customerDetail', { id: el.dataset.id }); return;
     case 'save-customer': await saveCustomerForm(); return;
     case 'toggle-customer': await toggleCustomer(el.dataset.id); return;
+    case 'delete-customer': await deleteCustomerPermanent(el.dataset.id); return;
+    case 'wa-customer': {
+      const c = customerById(el.dataset.id);
+      if (!c || !c.mobile){ toast('Customer has no mobile number', 'err'); return; }
+      const url = 'https://wa.me/' + cleanPhoneForWhatsApp(c.mobile);
+      window.open(url, '_blank');
+      return;
+    }
 
     /* companies */
     case 'add-company':  openCompanyForm(null); return;
@@ -2051,9 +2451,11 @@ document.addEventListener('click', async (ev) => {
     case 'save-company': await saveCompanyForm(); return;
 
     /* food items */
-    case 'add-food':  openFoodForm(null); return;
-    case 'edit-food': openFoodForm(el.dataset.id); return;
-    case 'save-food': await saveFoodForm(); return;
+    case 'add-food':    openFoodForm(null); return;
+    case 'edit-food':   openFoodForm(el.dataset.id); return;
+    case 'save-food':   await saveFoodForm(); return;
+    case 'toggle-food': await toggleFoodStatus(el.dataset.id); return;
+    case 'delete-food': await deleteFoodPermanent(el.dataset.id); return;
 
     /* customer detail tabs */
     case 'cust-tab':
@@ -2088,6 +2490,19 @@ document.addEventListener('click', async (ev) => {
       return;
     }
 
+    /* WhatsApp */
+    case 'wa-daily-prompt': {
+      const id = el.dataset.id, date = el.dataset.date;
+      sendDailyEntryWhatsApp(id, date);
+      closeModal();
+      return;
+    }
+    case 'wa-entry': {
+      const id = el.dataset.id, date = el.dataset.date;
+      sendDailyEntryWhatsApp(id, date);
+      return;
+    }
+
     /* register */
     case 'reg-cell': openRegisterCell(el.dataset.id, el.dataset.date); return;
     case 'reg-edit': {
@@ -2101,38 +2516,28 @@ document.addEventListener('click', async (ev) => {
       await deleteEntry(id, d);
       return;
     }
+    case 'reg-whatsapp': {
+      sendDailyEntryWhatsApp(el.dataset.id, el.dataset.date);
+      return;
+    }
     case 'export-register-excel': await exportRegisterExcel(); return;
     case 'export-register-pdf':   await exportRegisterPDF(); return;
+    case 'share-monthly':         openShareMonthlyReport(); return;
+    case 'share-monthly-generate': await generateAndShareMonthly(); return;
 
     /* payments */
     case 'add-payment': openPaymentForm(el.dataset.id || null); return;
     case 'save-payment': await savePaymentForm(); return;
-    case 'delete-payment': {
-      const id = el.dataset.id;
-      const ok = await askConfirm('Delete this payment? This cannot be undone.', 'Delete');
-      if (!ok) return;
-      await dbDelete('payments', id);
-      toast('Payment deleted', 'ok');
-      await refresh();
-      return;
-    }
+    case 'delete-payment': await deletePaymentById(el.dataset.id); return;
 
     /* bills */
     case 'gen-customer-bill': openBillGenerator('CUSTOMER'); return;
     case 'gen-company-bill':  openBillGenerator('COMPANY'); return;
     case 'create-bill':       await createBill(); return;
     case 'view-bill':         viewBill(el.dataset.id); return;
-    case 'delete-bill': {
-      const ok = await askConfirm('Delete this bill record? Payments linked to it stay.', 'Delete');
-      if (!ok) return;
-      await dbDelete('bills', el.dataset.id);
-      closeModal();
-      toast('Bill deleted', 'ok');
-      await refresh();
-      return;
-    }
-    case 'print-bill': window.print(); return;
-    case 'pdf-bill':   await exportBillPDF(el.dataset.id); return;
+    case 'delete-bill':       await deleteBillSafe(el.dataset.id); return;
+    case 'print-bill':        window.print(); return;
+    case 'pdf-bill':          await exportBillPDF(el.dataset.id); return;
 
     /* backup */
     case 'export-backup': exportBackup(); return;
@@ -2172,6 +2577,16 @@ document.addEventListener('change', (ev) => {
   if (t.id === 'repCustomer'){ state.ui.reportCustomer = t.value; renderReportInto(); return; }
 
   if (t.id === 'entryStatus'){ recalcEntryModal(); return; }
+
+  /* dynamic payment mode fields */
+  if (t.id === 'payModeSelect'){
+    const mode = t.value;
+    const container = $('#payModeFields');
+    if (container){
+      container.innerHTML = paymentModeFieldsHtml(mode);
+    }
+    return;
+  }
 
   if (t.classList.contains('it-food')){
     const row = t.closest('.item-row');
@@ -2299,6 +2714,7 @@ async function savePaymentForm(){
   const amount = Number(f.amount.value) || 0;
   if (amount <= 0){ toast('Enter a valid amount', 'err'); return; }
 
+  const mode = f.paymentMode.value;
   const obj = {
     id: uid(),
     customerId: customer.id,
@@ -2306,11 +2722,29 @@ async function savePaymentForm(){
     billId: f.billId.value || '',
     paymentDate: f.paymentDate.value || todayISO(),
     amount,
-    paymentMode: f.paymentMode.value,
-    reference: f.reference.value.trim(),
-    notes: f.notes.value.trim(),
+    paymentMode: mode,
+    notes: (f.notes.value || '').trim(),
     createdAt: new Date().toISOString()
   };
+
+  if (mode === 'UPI'){
+    obj.upiTransactionId = (f.upiTransactionId && f.upiTransactionId.value || '').trim();
+    obj.upiApp = (f.upiApp && f.upiApp.value || '').trim();
+    if (!obj.upiTransactionId){ toast('UPI Transaction ID is required', 'err'); return; }
+  } else if (mode === 'Bank Transfer'){
+    obj.bankReference = (f.bankReference && f.bankReference.value || '').trim();
+    obj.bankName = (f.bankName && f.bankName.value || '').trim();
+    if (!obj.bankReference){ toast('Bank Reference is required', 'err'); return; }
+  } else if (mode === 'Cheque'){
+    obj.chequeNumber = (f.chequeNumber && f.chequeNumber.value || '').trim();
+    obj.chequeDate = (f.chequeDate && f.chequeDate.value || '').trim();
+    obj.bankName = (f.bankName && f.bankName.value || '').trim();
+    if (!obj.chequeNumber || !obj.chequeDate){ toast('Cheque number and date are required', 'err'); return; }
+  } else if (mode === 'Other'){
+    obj.reference = (f.reference && f.reference.value || '').trim();
+  }
+  /* Cash — no extra fields */
+
   await dbPut('payments', obj);
   closeModal();
   toast('Payment recorded', 'ok');
@@ -2348,11 +2782,9 @@ function injectManifest(){
 
 function registerServiceWorker(){
   if (!('serviceWorker' in navigator)) return;
-  if (!location.protocol.startsWith('http')) return; // file:// cannot use SW
+  if (!location.protocol.startsWith('http')) return;
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('sw.js').catch(() => {
-      /* sw.js is optional — the app still works, just without full offline caching */
-    });
+    navigator.serviceWorker.register('sw.js').catch(() => { /* optional */ });
   });
 }
 

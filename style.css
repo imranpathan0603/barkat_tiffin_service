@@ -301,6 +301,47 @@ tfoot td,tfoot th{background:#f8fafb; font-weight:700; border-top:2px solid var(
 .bill-doc .hd h2{margin:0; font-size:17px; color:var(--primary-dark);}
 .bill-doc table{width:100%; font-size:12.5px;}
 .bill-doc th,.bill-doc td{padding:6px 5px;}
+
+/* ---------- Button rows & link buttons ---------- */
+/* ---------- Button rows & link buttons (mobile-first) ---------- */
+.btn-row{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:8px;
+  margin-top:10px;
+}
+.btn-row .btn{
+  width:100%;
+  min-width:0;
+  padding:10px 8px;
+  font-size:13px;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  text-align:center;
+}
+.btn.link{text-decoration:none;color:inherit;}
+.btn.link.ghost{color:var(--primary);}
+
+.food-actions{
+  display:flex;
+  gap:6px;
+  margin-top:6px;
+  justify-content:flex-end;
+  flex-wrap:wrap;
+}
+.food-actions .btn{
+  padding:6px 10px;
+  font-size:12px;
+  min-height:32px;
+  white-space:nowrap;
+}
+
+@media (min-width:520px){
+  .btn-row{grid-template-columns:repeat(auto-fit, minmax(130px, 1fr));}
+}
+.payment-fields{margin-top:2px;}
+.wa-preview{background:#f0fdfa;border:1px solid #ccfbf1;border-radius:10px;padding:10px;margin-top:8px;font-size:13.5px;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;}
 @media print{
   .appbar,.bottomnav,.drawer,.scrim,.toasts,.sheet-foot,.sheet-head{display:none !important;}
   .modal{position:static; display:block; background:#fff;}
